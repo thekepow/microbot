@@ -12,29 +12,54 @@ import com.google.inject.Injector;
 import com.google.inject.Module;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.RuneLite;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.events.ExternalPluginsChanged;
 import net.runelite.client.plugins.*;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
+import javax.swing.*;
 import java.io.File;
 import java.io.IOException;
-import java.nio.file.Files;
+import java.net.URISyntaxException;
+import java.nio.file.*;
+import java.security.CodeSource;
 import java.util.*;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
+
+import static java.nio.file.StandardWatchEventKinds.*;
+
 @Singleton
 @Slf4j
 public class MicrobotPluginManager {
 
     private final PluginManager pluginManager;
+	private final EventBus eventBus;
+    private static final File MICROBOT_PLUGINS = new File(RuneLite.RUNELITE_DIR, "microbot-plugins");
+    private final ScheduledExecutorService scheduledExecutorService;
+    private WatchService watchService;
 
     @Inject
-    MicrobotPluginManager(PluginManager pluginManager) {
+    MicrobotPluginManager(
+        PluginManager pluginManager,
+		EventBus eventBus,
+        ScheduledExecutorService scheduledExecutorService
+    ) {
         this.pluginManager = pluginManager;
+        try {
+            this.watchService = FileSystems.getDefault().newWatchService();
+            MICROBOT_PLUGINS.toPath().register(watchService, ENTRY_CREATE, ENTRY_MODIFY, ENTRY_DELETE);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        this.scheduledExecutorService = scheduledExecutorService;
+        this.eventBus = eventBus;
     }
 
     public static File[] createSideloadingFolder() {
-        final File MICROBOT_PLUGINS = new File(RuneLite.RUNELITE_DIR, "microbot-plugins");
         if (!Files.exists(MICROBOT_PLUGINS.toPath())) {
             try {
                 Files.createDirectories(MICROBOT_PLUGINS.toPath());
@@ -78,6 +103,7 @@ public class MicrobotPluginManager {
                 }
             }
         }
+        startWatching();
     }
 
     /**
@@ -235,5 +261,145 @@ public class MicrobotPluginManager {
 
         log.debug("Loaded plugin {}", clazz.getSimpleName());
         return plugin;
+    }
+
+    public void startWatching() {
+        scheduledExecutorService.scheduleAtFixedRate(() -> {
+            try {
+                WatchKey key;
+                boolean changeOccurred = false;
+                while ((key = watchService.poll()) != null) {
+                    for (WatchEvent<?> event : key.pollEvents()) {
+                        WatchEvent.Kind<?> kind = event.kind();
+                        Path fileName = (Path) event.context();
+                        if (fileName.toString().endsWith(".jar")) {
+                            File pluginFile = MICROBOT_PLUGINS.toPath().resolve(fileName).toFile();
+
+                            if (kind == ENTRY_CREATE || kind == ENTRY_MODIFY) {
+                                // Stop the plugin if it's running, then reload it
+                                changeOccurred = true;
+                                reloadPlugins(pluginFile);
+                            } else if (kind == ENTRY_DELETE) {
+                                // Unload the plugin if it's deleted
+                                changeOccurred = true;
+                                unloadPlugins(pluginFile);
+                            }
+                        }
+                    }
+                    key.reset();
+                }
+                if (changeOccurred)
+                    eventBus.post(new ExternalPluginsChanged());
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }, 10, 5, TimeUnit.SECONDS);
+    }
+    /**
+     * Reload a single plugin by stopping and starting it again.
+     *
+     * @param pluginFile The plugin file to reload.
+     */
+    private void reloadPlugins(File pluginFile) {
+        System.out.println("Detected changes on file "+pluginFile.getName());
+        SwingUtilities.invokeLater(() -> {
+            List<Plugin> plugins = findPluginByFile(pluginFile);
+            List<String> enabledPlugins = new ArrayList<>();
+            for (var plugin : plugins) {
+                if (pluginManager.isPluginEnabled(plugin)) enabledPlugins.add(plugin.getName());
+                stopAndRemovePlugin(plugin);
+            }
+
+            try {
+                List<Plugin> newPlugins = loadPluginsFromFile(pluginFile);
+                for (var p : newPlugins) {
+                    if (enabledPlugins.contains(p.getName())) {
+                        pluginManager.setPluginEnabled(p, true);
+                        pluginManager.startPlugin(p);
+                    }
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        });
+    }
+
+    /**
+     * Unload a single plugin by stopping and removing it.
+     *
+     * @param pluginFile The plugin file to unload.
+     */
+    private void unloadPlugins(File pluginFile) {
+        SwingUtilities.invokeLater(() -> {
+            List<Plugin> plugins = findPluginByFile(pluginFile);
+            for (var plugin : plugins) stopAndRemovePlugin(plugin);
+        });
+    }
+
+    /**
+     * Find a loaded plugin by matching its corresponding jar file.
+     *
+     * @param pluginFile The jar file of the plugin.
+     * @return The loaded plugin, or null if not found.
+     */
+    private List<Plugin> findPluginByFile(File pluginFile) {
+        return pluginManager.getPlugins().stream()
+            .filter(p -> getJarFile(p).equals(pluginFile))
+            .collect(Collectors.toList());
+    }
+
+    private static File getJarFile(Plugin plugin) {
+        CodeSource codeSource = plugin.getClass().getProtectionDomain().getCodeSource();
+
+        if (codeSource != null && codeSource.getLocation() != null) {
+            try {
+                return new File(codeSource.getLocation().toURI());
+            } catch (URISyntaxException e) {
+                e.printStackTrace();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Stop and remove the given plugin from the plugin manager.
+     *
+     * @param plugin The plugin to stop and remove.
+     */
+    private void stopAndRemovePlugin(Plugin plugin) {
+        try {
+            System.out.println("Removing plugin "+plugin.getName());
+            pluginManager.setPluginEnabled(plugin, false);
+            pluginManager.stopPlugin(plugin);
+        } catch (PluginInstantiationException e) {
+            e.printStackTrace();
+        }
+        pluginManager.remove(plugin);
+    }
+
+    /**
+     * Load a plugin from its jar file.
+     *
+     * @param pluginFile The jar file of the plugin.
+     * @return A list of loaded plugins.
+     * @throws IOException If the plugin file cannot be read.
+     * @throws PluginInstantiationException
+     */
+    private List<Plugin> loadPluginsFromFile(File pluginFile) throws IOException, PluginInstantiationException {
+        ClassLoader classLoader = new MicrobotPluginClassLoader(pluginFile, getClass().getClassLoader());
+        List<Class<?>> pluginClasses = ClassPath.from(classLoader).getAllClasses().stream()
+            .map(classInfo -> {
+                try {
+                    return classLoader.loadClass(classInfo.getName());
+                } catch (ClassNotFoundException e) {
+                    throw new RuntimeException(e);
+                }
+            })
+            .filter(cls -> Plugin.class.isAssignableFrom(cls))
+            .collect(Collectors.toList());
+
+
+        List<Plugin> plugins = loadPlugins(pluginClasses, null);
+        return plugins;
     }
 }
