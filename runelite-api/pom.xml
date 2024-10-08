@@ -150,6 +150,7 @@
 				<version>${project.version}</version>
 				<executions>
 					<execution>
+						<?m2e execute onConfiguration,onIncremental?>
 						<id>pack-components</id>
 						<goals>
 							<goal>pack-components</goal>
