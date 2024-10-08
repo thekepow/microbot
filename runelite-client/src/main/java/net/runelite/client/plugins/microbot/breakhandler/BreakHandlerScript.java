@@ -19,6 +19,7 @@ public class BreakHandlerScript extends Script {
 
     public static int breakIn = -1;
     public static int breakDuration = -1;
+    public static boolean wasInBreak = false;
 
     public static int totalBreaks = 0;
 
@@ -75,10 +76,11 @@ public class BreakHandlerScript extends Script {
                     }
                 }
 
-                if (breakDuration <= 0 && Microbot.pauseAllScripts) {
+                if (breakDuration <= 0 && wasInBreak) {
                     if (Rs2AntibanSettings.universalAntiban && Rs2AntibanSettings.actionCooldownActive)
                         return;
                     Microbot.pauseAllScripts = false;
+                    wasInBreak = false;
                     if (breakIn <= 0)
                         breakIn = Random.random(config.timeUntilBreakStart() * 60, config.timeUntilBreakEnd() * 60);
 
@@ -93,6 +95,7 @@ public class BreakHandlerScript extends Script {
 
                 if ((breakIn <= 0 && !Microbot.pauseAllScripts && !isLockState()) || (Rs2AntibanSettings.microBreakActive && !Microbot.pauseAllScripts && !isLockState())) {
                     Microbot.pauseAllScripts = true;
+                    wasInBreak = true;
 
                     if (Rs2AntibanSettings.microBreakActive)
                         return;
