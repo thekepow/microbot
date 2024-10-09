@@ -21,6 +21,7 @@ import javax.inject.Singleton;
 import javax.swing.*;
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.net.URISyntaxException;
 import java.nio.file.*;
 import java.security.CodeSource;
@@ -41,6 +42,7 @@ public class MicrobotPluginManager {
     private static final File MICROBOT_PLUGINS = new File(RuneLite.RUNELITE_DIR, "microbot-plugins");
     private final ScheduledExecutorService scheduledExecutorService;
     private WatchService watchService;
+    private Map<String, MicrobotPluginClassLoader> classLoaders = new LinkedHashMap<>();
 
     @Inject
     MicrobotPluginManager(
@@ -87,15 +89,9 @@ public class MicrobotPluginManager {
 
                 try
                 {
-                    MicrobotPluginClassLoader classLoader = new MicrobotPluginClassLoader(f, getClass().getClassLoader());
-
-                    List<Class<?>> plugins = ClassPath.from(classLoader)
-                            .getAllClasses()
-                            .stream()
-                            .map(ClassPath.ClassInfo::load)
-                            .collect(Collectors.toList());
-
-                    loadPlugins(plugins, null);
+                    var classLoader = new MicrobotPluginClassLoader(f, getClass().getClassLoader());
+                    classLoaders.put(f.getAbsolutePath(), classLoader);
+                    loadPluginsFromFile(f);
                 }
                 catch (PluginInstantiationException | IOException ex)
                 {
@@ -275,7 +271,7 @@ public class MicrobotPluginManager {
                         if (fileName.toString().endsWith(".jar")) {
                             File pluginFile = MICROBOT_PLUGINS.toPath().resolve(fileName).toFile();
 
-                            if (kind == ENTRY_CREATE || kind == ENTRY_MODIFY) {
+                            if (kind == ENTRY_MODIFY) {
                                 // Stop the plugin if it's running, then reload it
                                 changeOccurred = true;
                                 reloadPlugins(pluginFile);
@@ -299,17 +295,26 @@ public class MicrobotPluginManager {
      * Reload a single plugin by stopping and starting it again.
      *
      * @param pluginFile The plugin file to reload.
+     * @throws InterruptedException
+     * @throws InvocationTargetException
      */
-    private void reloadPlugins(File pluginFile) {
+    private void reloadPlugins(File pluginFile) throws InvocationTargetException, InterruptedException {
         System.out.println("Detected changes on file "+pluginFile.getName());
-        SwingUtilities.invokeLater(() -> {
-            List<Plugin> plugins = findPluginByFile(pluginFile);
+
+        SwingUtilities.invokeAndWait(() -> {
             List<String> enabledPlugins = new ArrayList<>();
+            var classLoader = classLoaders.get(pluginFile.getAbsolutePath());
+            if (classLoader != null)
+                try {
+                    classLoader.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            List<Plugin> plugins = findPluginByFile(pluginFile);
             for (var plugin : plugins) {
                 if (pluginManager.isPluginEnabled(plugin)) enabledPlugins.add(plugin.getName());
                 stopAndRemovePlugin(plugin);
             }
-
             try {
                 List<Plugin> newPlugins = loadPluginsFromFile(pluginFile);
                 for (var p : newPlugins) {
@@ -386,7 +391,8 @@ public class MicrobotPluginManager {
      * @throws PluginInstantiationException
      */
     private List<Plugin> loadPluginsFromFile(File pluginFile) throws IOException, PluginInstantiationException {
-        ClassLoader classLoader = new MicrobotPluginClassLoader(pluginFile, getClass().getClassLoader());
+        var classLoader = new MicrobotPluginClassLoader(pluginFile, getClass().getClassLoader());
+        classLoaders.put(pluginFile.getAbsolutePath(), classLoader);
         List<Class<?>> pluginClasses = ClassPath.from(classLoader).getAllClasses().stream()
             .map(classInfo -> {
                 try {
