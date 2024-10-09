@@ -64,11 +64,13 @@ public class BankTrackerPanel extends PluginPanel {
     }
 
     private Supplier<List<BankTrackerItem>> supplierForTab(int tab) {
-        final int start = IntStream.range(0, tab).map(x -> tabCounts[x]).sum();
-        final int length = tab == MAX_BANK_TABS ? items.size()-start-1 : tabCounts[tab];
-        return () -> IntStream.range(start, start+length)
+        return () -> {
+            final int start = IntStream.range(0, tab).map(x -> tabCounts[x]).sum();
+            final int length = tab == MAX_BANK_TABS ? items.size()-start-1 : tabCounts[tab];
+            return IntStream.range(start, start+length)
                               .mapToObj(items::get)
                               .collect(Collectors.toList());
+        };
 
     }
 
