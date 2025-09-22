@@ -44,6 +44,7 @@ import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.PluginChanged;
 import net.runelite.client.events.ProfileChanged;
+import net.runelite.client.events.ExternalPluginsChanged;
 import net.runelite.client.plugins.microbot.Microbot;
 import net.runelite.client.task.Schedule;
 import net.runelite.client.task.ScheduledMethod;
@@ -58,14 +59,22 @@ import javax.inject.Provider;
 import javax.inject.Singleton;
 import javax.swing.*;
 import java.io.File;
+import java.io.Closeable;
 import java.io.IOException;
+import java.net.URISyntaxException;
+import java.nio.file.*;
+import java.security.CodeSource;
 import java.lang.invoke.*;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.*;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.*;
 import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
+
+import static java.nio.file.StandardWatchEventKinds.ENTRY_CREATE;
+import static java.nio.file.StandardWatchEventKinds.ENTRY_DELETE;
+import static java.nio.file.StandardWatchEventKinds.ENTRY_MODIFY;
 
 @Singleton
 @Slf4j
@@ -84,6 +93,13 @@ public class PluginManager {
     private final List<Plugin> plugins = new CopyOnWriteArrayList<>();
     @Getter
     private final List<Plugin> activePlugins = new CopyOnWriteArrayList<>();
+
+    // Hot-reload support fields
+    private WatchService watchService;
+    private Thread pluginWatchThread;
+    private ScheduledExecutorService hotReloadExecutor;
+    private static final long HOT_RELOAD_DEBOUNCE_MS = 750L;
+    private final Map<File, PluginFileEvent> pendingPluginFileEvents = new ConcurrentHashMap<>();
 
     public void addPlugin(Plugin plugin) {
         plugins.add(plugin);
@@ -207,7 +223,7 @@ public class PluginManager {
                     SwingUtilities.invokeAndWait(() ->
                     {
                     runnable.run();
-                        
+
                     });
                 }
             } catch (InterruptedException | InvocationTargetException e) {
@@ -293,6 +309,285 @@ public class PluginManager {
                 }
             }
         }
+
+        // After initial load, start watching for hot-reload
+        startWatchingSideLoadPluginDirectories();
+    }
+
+    /**
+     * Initialize a file watcher on side-loaded plugin directories to support hot reloading
+     * when jar files are created, modified, or deleted.
+     */
+    private synchronized void startWatchingSideLoadPluginDirectories() {
+        if (pluginWatchThread != null && pluginWatchThread.isAlive()) {
+            return; // already running
+        }
+        try {
+            if (!SIDELOADED_PLUGINS.exists()) {
+                return; // directory absent; mimic original behavior (no creation side-effect)
+            }
+            watchService = FileSystems.getDefault().newWatchService();
+            SIDELOADED_PLUGINS.toPath().register(watchService, ENTRY_CREATE, ENTRY_MODIFY, ENTRY_DELETE);
+        } catch (IOException e) {
+            log.warn("Unable to start plugin hot-reload watcher", e);
+            return;
+        }
+
+        pluginWatchThread = new Thread(() -> {
+            log.info("Plugin hot-reload watcher started");
+            while (!Thread.currentThread().isInterrupted()) {
+                WatchKey key;
+                try {
+                    key = watchService.take(); // blocking
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Throwable t) {
+                    log.error("Watcher exception", t);
+                    sleepQuietly(5_000);
+                    continue;
+                }
+                final Path dir = (Path) key.watchable();
+                for (WatchEvent<?> event : key.pollEvents()) {
+                    WatchEvent.Kind<?> kind = event.kind();
+                    if (kind == StandardWatchEventKinds.OVERFLOW) continue;
+                    Path context = (Path) event.context();
+                    if (context == null) continue;
+                    if (!context.toString().endsWith(".jar")) continue;
+                    File jarFile = dir.resolve(context).toFile();
+                    recordPluginFileEvent(jarFile, kind);
+                }
+                boolean valid = key.reset();
+                if (!valid) {
+                    log.warn("Plugin watcher key no longer valid; restarting watcher");
+                    // Attempt restart
+                    startWatchingSideLoadPluginDirectories();
+                    break;
+                }
+            }
+            log.info("Plugin hot-reload watcher stopped");
+        }, "PluginManager-HotReload-Watcher");
+        pluginWatchThread.setDaemon(true);
+        pluginWatchThread.start();
+
+        if (hotReloadExecutor == null || hotReloadExecutor.isShutdown()) {
+            hotReloadExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "PluginManager-HotReload-Debounce");
+                t.setDaemon(true);
+                return t;
+            });
+            hotReloadExecutor.scheduleAtFixedRate(this::processDebouncedPluginFileEvents, HOT_RELOAD_DEBOUNCE_MS, HOT_RELOAD_DEBOUNCE_MS, TimeUnit.MILLISECONDS);
+        }
+
+        // Cleanup hook
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try { if (watchService != null) watchService.close(); } catch (IOException ignored) {}
+            if (hotReloadExecutor != null) hotReloadExecutor.shutdownNow();
+        }, "PluginManager-HotReload-Shutdown"));
+    }
+
+    private static void sleepQuietly(long millis) {
+        try { Thread.sleep(millis); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    private void reloadPluginsFromFile(File pluginFile) {
+        log.info("Detected change for plugin jar: {}", pluginFile.getName());
+        List<Plugin> existing = findPluginsByJar(pluginFile);
+        if (existing.isEmpty()) {
+            // new plugin jar added
+            try {
+                List<Plugin> newPlugins = loadPluginsFromJar(pluginFile);
+                log.info("Loaded {} new plugin(s) from {}", newPlugins.size(), pluginFile.getName());
+            } catch (Exception e) {
+                log.error("Failed loading new plugin jar {}", pluginFile.getName(), e);
+            }
+            return;
+        }
+        // Preserve enabled state
+        Set<String> enabledNames = existing.stream()
+                .filter(this::isPluginEnabled)
+                .map(this::pluginIdentity)
+                .collect(Collectors.toSet());
+
+        // Stop and remove synchronously on EDT
+        runOnEdtSync(() -> existing.forEach(this::stopAndRemovePlugin));
+        // Attempt to close classloaders used by these plugins
+        closeClassLoadersForPlugins(existing);
+
+        try {
+            List<Plugin> reloaded = loadPluginsFromJar(pluginFile);
+            List<Plugin> toStart = reloaded.stream()
+                    .filter(p -> enabledNames.contains(pluginIdentity(p)))
+                    .collect(Collectors.toList());
+            // Start synchronously on EDT
+            runOnEdtSync(() -> {
+                for (Plugin p : toStart) {
+                    try {
+                        setPluginEnabled(p, true);
+                        startPlugin(p);
+                    } catch (Exception ex) {
+                        log.error("Unable to start plugin {} after reload", p.getClass().getSimpleName(), ex);
+                    }
+                }
+            });
+            log.info("Reloaded {} plugin(s) from {}", reloaded.size(), pluginFile.getName());
+        } catch (Exception e) {
+            log.error("Failed reloading plugin jar {}", pluginFile.getName(), e);
+        }
+    }
+
+    private void recordPluginFileEvent(File jarFile, WatchEvent.Kind<?> kind) {
+        if (jarFile == null) return;
+        pendingPluginFileEvents.compute(jarFile, (file, current) -> {
+            long now = System.currentTimeMillis();
+            EventType newType = (kind == ENTRY_DELETE) ? EventType.DELETE : EventType.RELOAD;
+            if (current == null) {
+                return new PluginFileEvent(newType, now);
+            }
+            // Always reflect the last-seen event within the debounce window
+            current.type = newType;
+            current.lastChange = now;
+            return current;
+        });
+    }
+
+    private void processDebouncedPluginFileEvents() {
+        long now = System.currentTimeMillis();
+        List<Map.Entry<File, PluginFileEvent>> ready = new ArrayList<>();
+        for (Map.Entry<File, PluginFileEvent> e : pendingPluginFileEvents.entrySet()) {
+            if (now - e.getValue().lastChange >= HOT_RELOAD_DEBOUNCE_MS) {
+                ready.add(e);
+            }
+        }
+        if (ready.isEmpty()) return;
+        for (Map.Entry<File, PluginFileEvent> e : ready) {
+            pendingPluginFileEvents.remove(e.getKey());
+            PluginFileEvent ev = e.getValue();
+            // If final event was DELETE but file currently exists, treat as RELOAD (replace sequence)
+            if (ev.type == EventType.DELETE && e.getKey().exists()) {
+                ev.type = EventType.RELOAD;
+            }
+            if (ev.type == EventType.DELETE) {
+                unloadPluginsFromFile(e.getKey());
+            } else {
+                reloadPluginsFromFile(e.getKey());
+            }
+        }
+        // Notify listeners after processing a batch of changes
+        try {
+            eventBus.post(new ExternalPluginsChanged());
+        } catch (Throwable t) {
+            log.debug("Failed to post ExternalPluginsChanged", t);
+        }
+    }
+
+    private void unloadPluginsFromFile(File pluginFile) {
+        log.info("Detected deletion for plugin jar: {}", pluginFile.getName());
+        List<Plugin> existing = findPluginsByJar(pluginFile);
+        runOnEdtSync(() -> existing.forEach(this::stopAndRemovePlugin));
+        closeClassLoadersForPlugins(existing);
+    }
+
+    // Removed tryStartPluginOnEDT in favor of runOnEdtSync
+
+    private List<Plugin> loadPluginsFromJar(File pluginFile) throws IOException, PluginInstantiationException {
+        if (!pluginFile.exists()) return Collections.emptyList();
+        ClassLoader classLoader = new PluginClassLoader(pluginFile, getClass().getClassLoader());
+        List<Class<?>> pluginClasses = ClassPath.from(classLoader)
+                .getAllClasses()
+                .stream()
+                .map(ClassInfo::load)
+                .collect(Collectors.toList());
+        return loadPlugins(pluginClasses, null);
+    }
+
+    private List<Plugin> findPluginsByJar(File pluginFile) {
+        return plugins.stream()
+                .filter(p -> {
+                    File jar = getJarFile(p);
+                    return jar != null && jar.equals(pluginFile);
+                })
+                .collect(Collectors.toList());
+    }
+
+    private static File getJarFile(Plugin plugin) {
+        CodeSource codeSource = plugin.getClass().getProtectionDomain().getCodeSource();
+        if (codeSource != null && codeSource.getLocation() != null) {
+            try {
+                return new File(codeSource.getLocation().toURI());
+            } catch (URISyntaxException e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private void stopAndRemovePlugin(Plugin plugin) {
+        try {
+            setPluginEnabled(plugin, false);
+            if (activePlugins.contains(plugin)) {
+                stopPlugin(plugin);
+            }
+        } catch (PluginInstantiationException e) {
+            log.error("Error stopping plugin {} during reload", plugin.getClass().getSimpleName(), e);
+        }
+        try {
+            if (plugin.injector != null) {
+                ReflectUtil.queueInjectorAnnotationCacheInvalidation(plugin.injector);
+            }
+        } catch (Throwable t) {
+            log.debug("Injector cache invalidation failed for {}", plugin.getClass().getSimpleName(), t);
+        }
+        remove(plugin);
+        log.info("Removed plugin {}", pluginIdentity(plugin));
+    }
+
+    private String pluginIdentity(Plugin plugin) {
+        PluginDescriptor d = plugin.getClass().getAnnotation(PluginDescriptor.class);
+        return d != null ? d.name() : plugin.getClass().getSimpleName();
+    }
+
+    // Attempt to close classloaders used by a set of plugins to free jar locks
+    private void closeClassLoadersForPlugins(Collection<Plugin> ps) {
+        Set<ClassLoader> cls = ps.stream().map(p -> p.getClass().getClassLoader()).collect(Collectors.toSet());
+        for (ClassLoader cl : cls) {
+            if (cl instanceof Closeable) {
+                try {
+                    ((Closeable) cl).close();
+                } catch (IOException ioe) {
+                    log.debug("Failed to close plugin classloader", ioe);
+                }
+            }
+        }
+    }
+
+    // Helper to run code synchronously on the EDT
+    private void runOnEdtSync(Runnable r) {
+        if (SwingUtilities.isEventDispatchThread()) {
+            r.run();
+        } else {
+            try {
+                SwingUtilities.invokeAndWait(r);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (InvocationTargetException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof RuntimeException) throw (RuntimeException) cause;
+                if (cause instanceof Error) throw (Error) cause;
+                throw new RuntimeException(cause);
+            }
+        }
+    }
+
+    // Debounce support types
+    private enum EventType { RELOAD, DELETE }
+    private static final class PluginFileEvent {
+        EventType type;
+        long lastChange;
+        PluginFileEvent(EventType type, long lastChange) {
+            this.type = type;
+            this.lastChange = lastChange;
+        }
     }
 
     public List<Plugin> loadPlugins(List<Class<?>> plugins, BiConsumer<Integer, Integer> onPluginLoaded) throws PluginInstantiationException {
@@ -323,7 +618,9 @@ public class PluginManager {
                 continue;
             }
 
-            graph.addNode((Class<Plugin>) clazz);
+            @SuppressWarnings("unchecked")
+            Class<? extends Plugin> pluginClass = (Class<? extends Plugin>) clazz;
+            graph.addNode(pluginClass);
         }
 
         // Build plugin graph
@@ -348,7 +645,7 @@ public class PluginManager {
         for (Class<? extends Plugin> pluginClazz : sortedPlugins) {
             Plugin plugin;
             try {
-                plugin = instantiate(this.plugins, (Class<Plugin>) pluginClazz);
+                plugin = instantiate(this.plugins, pluginClazz);
                 newPlugins.add(plugin);
                 add(plugin);
             } catch (PluginInstantiationException ex) {
@@ -486,7 +783,7 @@ public class PluginManager {
         return activePlugins.contains(plugin);
     }
 
-    private Plugin instantiate(List<Plugin> scannedPlugins, Class<Plugin> clazz) throws PluginInstantiationException {
+    private Plugin instantiate(List<Plugin> scannedPlugins, Class<? extends Plugin> clazz) throws PluginInstantiationException {
         PluginDependency[] pluginDependencies = clazz.getAnnotationsByType(PluginDependency.class);
         List<Plugin> deps = new ArrayList<>();
         for (PluginDependency pluginDependency : pluginDependencies) {
@@ -512,10 +809,8 @@ public class PluginManager {
             if (deps.size() > 1) {
                 List<Module> modules = new ArrayList<>(deps.size());
                 for (Plugin p : deps) {
-                    // Create a module for each dependency
-                    Module module = (Binder binder) ->
-                    {
-                        binder.bind((Class<Plugin>) p.getClass()).toInstance(p);
+                    Module module = (Binder binder) -> {
+                        bindPluginInstance(binder, (Class<? extends Plugin>) p.getClass(), p);
                         binder.install(p);
                     };
                     modules.add(module);
@@ -532,7 +827,7 @@ public class PluginManager {
             Module pluginModule = (Binder binder) ->
             {
                 // Since the plugin itself is a module, it won't bind itself, so we'll bind it here
-                binder.bind(clazz).toInstance(plugin);
+                bindPluginInstance(binder, clazz, plugin);
                 binder.install(plugin);
             };
             Injector pluginInjector = parent.createChildInjector(pluginModule);
@@ -543,6 +838,11 @@ public class PluginManager {
 
         log.debug("Loaded plugin {}", clazz.getSimpleName());
         return plugin;
+    }
+
+    private static <T extends Plugin> void bindPluginInstance(Binder binder, Class<T> cls, Plugin instance) {
+    // Safe due to type hierarchy of plugins
+    binder.bind(cls).toInstance(cls.cast(instance));
     }
 
     public void add(Plugin plugin) {
